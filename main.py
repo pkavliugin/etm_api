@@ -1,6 +1,18 @@
 """
-Минимальный FastAPI backend для загрузки и обработки Excel файлов.
-Endpoint POST /upload принимает xlsx файл и возвращает структурированные данные.
+ETM Excel Processor - Профессиональная обработка спецификаций
+
+Цель приложения:
+- Обработка Excel спецификаций товаров
+- Получение актуальных данных из API ЭТМ:
+  * Цен на товары
+  * Информации о наличии и сроках поставки
+  * Артикулов товаров
+- Формирование структурированного Excel файла
+
+Результат используется для:
+- Расчета коммерческих предложений
+- Планирования закупок материалов
+- Анализа ценовой политики поставщиков
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -9,8 +21,12 @@ import pandas as pd
 from io import BytesIO
 import logging
 import requests
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 import re
+import os
+from cachetools import TTLCache
+from rapidfuzz import fuzz
+import json
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -21,8 +37,10 @@ logger = logging.getLogger(__name__)
 ETM_API_BASE_URL = "https://ipro.etm.ru/api"  # Production API
 # ETM_API_BASE_URL = "https://itest2.etm.ru/api"  # Test API
 
-ETM_LOGIN = "your_login"  # Замените на ваши учетные данные
-ETM_PASSWORD = "your_password"
+# ⚠️ ВАЖНО: Установите свои учетные данные ETM для работы с API
+# Получите их на https://ipro.etm.ru/
+ETM_LOGIN = os.getenv("ETM_LOGIN", "test_user")
+ETM_PASSWORD = os.getenv("ETM_PASSWORD", "test_password")
 ETM_SESSION_KEY = None  # Будет заполнен при авторизации
 
 # Параметры запроса
@@ -34,8 +52,8 @@ REQUEST_TIMEOUT = 10  # секунды
 # - Цены (/goods/{id}/price): 1 запрос в секунду
 # - Остатки (/goods/{id}/remains): 1 запрос в секунду
 
-# Кэш для результатов поиска
-cache = {}
+# Кэш для результатов поиска с TTL 1 час (3600 секунд)
+cache = TTLCache(maxsize=1000, ttl=3600)
 
 # Инициализация приложения
 app = FastAPI(
@@ -118,20 +136,144 @@ def normalize_name(name: str) -> str:
     return name
 
 
-def search_etm(name: str, code_type: str = "etm") -> Dict[str, Any]:
+def extract_etm_data(etm_result: Dict[str, Any], original_name: str) -> Dict[str, Any]:
     """
-    Функция для поиска товара в ETM через API (GET /v2/goods/{id}).
-    Результаты кэшируются для оптимизации.
+    Извлечение данных из ответа ETM API с выбором лучшего товара.
+    
+    Если API возвращает несколько товаров:
+    1. Выбирает лучший матч по названию (fuzzy matching)
+    2. Среди похожих выбирает товар с наличием, затем с минимальной ценой
+    3. Сохраняет топ-3 варианта для анализа
     
     Args:
-        name: Название или код товара для поиска
-        code_type: Тип кода (etm, cli, mnf). По умолчанию 'etm'
-            - etm: коды ЭТМ (только цифры без префикса ETM)
-            - cli: коды клиента (требует сопоставления с менеджером)
-            - mnf: артикулы производителя
+        etm_result: Результат от search_etm()
+        original_name: Исходное название для fuzzy matching
     
     Returns:
-        Dict: Результат поиска от API или словарь с ошибкой
+        Dict с ключами: 'found_name', 'article', 'unit', 'unit_price', 'availability', 'status', 'alternatives'
+    """
+    result = {
+        'found_name': 'не найдено',
+        'article': 'не найден',
+        'unit': 'не указано',
+        'unit_price': None,
+        'availability': 'неизвестно',
+        'status': 'not_found',
+        'alternatives': []
+    }
+    
+    try:
+        # Если была ошибка при запросе
+        if etm_result.get('error'):
+            result['status'] = 'error'
+            return result
+        
+        # Получаем список товаров
+        goods_list = etm_result.get('data', [])
+        if not goods_list:
+            return result
+        
+        # Если вернулся один товар (не список)
+        if isinstance(goods_list, dict):
+            goods_list = [goods_list]
+        
+        # Нормализуем исходное название для сравнения
+        normalized_original = normalize_name(original_name)
+        
+        # Оцениваем каждый товар
+        scored_goods = []
+        for good in goods_list:
+            name = good.get('name') or good.get('title') or ''
+            normalized_name = normalize_name(name)
+            
+            # Fuzzy matching score
+            score = fuzz.ratio(normalized_original, normalized_name)
+            
+            # Извлекаем данные
+            article = good.get('article') or good.get('code') or good.get('id') or 'не найден'
+            unit = good.get('unit') or good.get('units') or good.get('measure') or 'не указано'
+            price = good.get('price') or good.get('unit_price') or good.get('price_per_unit')
+            availability = good.get('availability') or good.get('stock') or good.get('remains') or 'неизвестно'
+            
+            # Преобразуем цену в float
+            try:
+                price = float(price) if price is not None else None
+            except (ValueError, TypeError):
+                price = None
+            
+            scored_goods.append({
+                'good': good,
+                'name': name,
+                'article': article,
+                'unit': unit,
+                'price': price,
+                'availability': availability,
+                'score': score
+            })
+        
+        # Сортируем по score (лучший матч первым)
+        scored_goods.sort(key=lambda x: x['score'], reverse=True)
+        
+        # Выбираем лучший товар
+        best_good = None
+        if scored_goods:
+            # Фильтруем товары с достаточным совпадением (score > 70)
+            relevant_goods = [g for g in scored_goods if g['score'] > 70]
+            if not relevant_goods:
+                # Если нет релевантных, берем лучший по score
+                relevant_goods = [scored_goods[0]]
+            
+            # Среди релевантных сначала ищем товары с наличием
+            available_goods = [g for g in relevant_goods if str(g['availability']).lower() not in ['0', 'нет', 'неизвестно', '']]
+            if available_goods:
+                # Среди доступных выбираем с минимальной ценой
+                best_good = min(available_goods, key=lambda x: x['price'] or float('inf'))
+            else:
+                # Если нет доступных, выбираем с минимальной ценой среди релевантных
+                best_good = min(relevant_goods, key=lambda x: x['price'] or float('inf'))
+        
+        if best_good:
+            result.update({
+                'found_name': best_good['name'],
+                'article': best_good['article'],
+                'unit': best_good['unit'],
+                'unit_price': best_good['price'],
+                'availability': best_good['availability'],
+                'status': 'ok'
+            })
+        
+        # Сохраняем топ-3 альтернатив (кроме основного)
+        alternatives = []
+        for g in scored_goods[:4]:  # топ-4, исключая основной если он там
+            if g != best_good:
+                alternatives.append({
+                    'name': g['name'],
+                    'article': g['article'],
+                    'price': g['price'],
+                    'availability': g['availability']
+                })
+            if len(alternatives) >= 3:
+                break
+        result['alternatives'] = json.dumps(alternatives, ensure_ascii=False)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при извлечении данных из ETM: {str(e)}")
+        result['status'] = 'error'
+    
+    return result
+
+
+def search_etm(name: str) -> Dict[str, Any]:
+    """
+    Поиск товаров в ETM через API.
+    Использует поисковый endpoint для получения списка товаров.
+    Результаты кэшируются с TTL.
+    
+    Args:
+        name: Название товара для поиска
+    
+    Returns:
+        Dict: Результат поиска с списком товаров или ошибка
     """
     # Нормализация названия перед поиском
     normalized_name = normalize_name(name)
@@ -145,37 +287,38 @@ def search_etm(name: str, code_type: str = "etm") -> Dict[str, Any]:
         # Получение session ключа для авторизации
         session_key = get_etm_session()
         
-        # Формирование параметров GET запроса к API характеристик
-        # Документация: GET /v2/goods/{id}
-        goods_url = f"{ETM_API_BASE_URL}/v2/goods/{normalized_name}"
+        # Используем поисковый endpoint для получения списка товаров
+        # POST /v1/goods/search
+        search_url = f"{ETM_API_BASE_URL}/v1/goods/search"
         params = {
-            "type": code_type,
-            "session-id": session_key
+            "session-id": session_key,
+            "query": normalized_name,
+            "limit": 10  # Ограничиваем до 10 результатов
         }
         
-        logger.info(f"Запрос характеристик товара: {name} ({code_type}={normalized_name})")
-        response = requests.get(
-            goods_url,
-            params=params,
+        logger.info(f"Поиск товаров в ETM API: {name}")
+        response = requests.post(
+            search_url,
+            json=params,  # POST с JSON телом
             timeout=REQUEST_TIMEOUT
         )
         
         # Проверка статуса ответа
         response.raise_for_status()
         
-        # Структура ответа согласно документации ETM API
         data = response.json()
         if data.get("status", {}).get("code") != 200:
             logger.warning(f"ETM API вернул ошибку: {data.get('status', {}).get('message')}")
             return {"error": "API_ERROR", "message": data.get('status', {}).get('message')}
         
-        logger.info(f"Успешный ответ от ETM API для: {normalized_name}")
-        
-        # Возврат структурированного результата
-        result = {
-            "status": "success",
-            "data": data.get("data", {})
-        }
+        # Извлекаем список товаров
+        goods = data.get("data", {}).get("goods", [])
+        if not goods:
+            logger.info(f"Товары не найдены для: {normalized_name}")
+            result = {"status": "not_found", "data": []}
+        else:
+            logger.info(f"Найдено {len(goods)} товаров для: {normalized_name}")
+            result = {"status": "success", "data": goods}
         
         # Сохранение результата в кэш
         cache[normalized_name] = result
@@ -221,7 +364,8 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ETM API - Excel Processor</title>
+    <meta name="description" content="Professional Excel processing with ETM API integration">
+    <title>ETM Excel Processor - Pro</title>
     <style>
         * {
             margin: 0;
@@ -229,103 +373,264 @@ HTML_TEMPLATE = """
             box-sizing: border-box;
         }
         
+        :root {
+            --color-primary: #1a1a1a;
+            --color-secondary: #666666;
+            --color-border: #e0e0e0;
+            --color-bg: #ffffff;
+            --color-bg-light: #f9fafb;
+            --color-accent: #3b82f6;
+            --color-accent-hover: #2563eb;
+            --color-success: #10b981;
+            --color-error: #ef4444;
+            --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+            --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        
+        html, body {
+            height: 100%;
+        }
+        
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif;
+            background: var(--color-bg-light);
+            color: var(--color-primary);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+        
+        .wrapper {
             min-height: 100vh;
             display: flex;
+            flex-direction: column;
             align-items: center;
             justify-content: center;
-            padding: 20px;
+            padding: 24px;
         }
         
         .container {
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-            padding: 40px;
-            max-width: 500px;
             width: 100%;
+            max-width: 600px;
+            animation: fadeInUp 0.6s ease-out;
+        }
+        
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .header-section {
+            text-align: center;
+            margin-bottom: 48px;
+        }
+        
+        .logo {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 24px;
+            font-weight: 600;
+            font-size: 18px;
+            color: var(--color-primary);
+        }
+        
+        .logo-icon {
+            font-size: 24px;
         }
         
         h1 {
-            color: #333;
-            margin-bottom: 10px;
-            font-size: 28px;
+            font-size: 32px;
+            font-weight: 700;
+            margin-bottom: 12px;
+            letter-spacing: -0.5px;
         }
         
         .subtitle {
-            color: #666;
-            font-size: 14px;
-            margin-bottom: 30px;
+            font-size: 15px;
+            color: var(--color-secondary);
+            margin-bottom: 0;
+            line-height: 1.5;
+        }
+        
+        .main-section {
+            background: var(--color-bg);
+            border: 1px solid var(--color-border);
+            border-radius: 14px;
+            padding: 40px;
+            box-shadow: var(--shadow-lg);
+        }
+        
+        form {
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+        
+        .upload-wrapper {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        
+        .upload-label {
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--color-secondary);
         }
         
         .upload-area {
-            border: 2px dashed #667eea;
-            border-radius: 8px;
-            padding: 30px;
+            border: 2px solid var(--color-border);
+            border-radius: 12px;
+            padding: 48px 24px;
             text-align: center;
             cursor: pointer;
-            transition: all 0.3s ease;
-            background-color: #f8f9fa;
+            transition: var(--transition);
+            background: var(--color-bg-light);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .upload-area::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(135deg, rgba(59, 130, 246, 0.05) 0%, transparent 100%);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            pointer-events: none;
         }
         
         .upload-area:hover {
-            border-color: #764ba2;
-            background-color: #f0f0f0;
+            border-color: var(--color-accent);
+            background: linear-gradient(135deg, rgba(59, 130, 246, 0.02) 0%, transparent 100%);
+        }
+        
+        .upload-area:hover::before {
+            opacity: 1;
         }
         
         .upload-area.dragover {
-            border-color: #764ba2;
-            background-color: #e8e4f3;
+            border-color: var(--color-accent);
+            background: rgba(59, 130, 246, 0.05);
             transform: scale(1.02);
         }
         
         .upload-icon {
-            font-size: 48px;
-            margin-bottom: 15px;
+            font-size: 56px;
+            margin-bottom: 16px;
+            display: block;
+            filter: drop-shadow(0 0 0px transparent);
+            transition: filter 0.3s ease;
+        }
+        
+        .upload-area:hover .upload-icon {
+            filter: drop-shadow(0 4px 8px rgba(59, 130, 246, 0.2));
         }
         
         .upload-text {
-            color: #666;
-            font-size: 16px;
-            margin-bottom: 10px;
+            color: var(--color-primary);
+            font-size: 15px;
+            font-weight: 600;
+            margin-bottom: 6px;
         }
         
         .upload-hint {
-            color: #999;
+            color: var(--color-secondary);
             font-size: 13px;
+            margin-bottom: 0;
         }
         
         input[type="file"] {
             display: none;
         }
         
+        .file-info {
+            padding: 12px 16px;
+            background: rgba(16, 185, 129, 0.05);
+            border: 1px solid rgba(16, 185, 129, 0.2);
+            border-radius: 8px;
+            display: none;
+            align-items: center;
+            gap: 10px;
+            animation: slideDown 0.3s ease-out;
+        }
+        
+        .file-info.show {
+            display: flex;
+        }
+        
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .file-info-icon {
+            font-size: 20px;
+            color: var(--color-success);
+        }
+        
+        .file-info-content {
+            flex: 1;
+        }
+        
+        .file-name {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--color-primary);
+            word-break: break-all;
+        }
+        
         .button-group {
             display: flex;
-            gap: 10px;
-            margin-top: 30px;
+            gap: 12px;
         }
         
         button {
             flex: 1;
             padding: 12px 24px;
             border: none;
-            border-radius: 6px;
-            font-size: 16px;
+            border-radius: 10px;
+            font-size: 15px;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: var(--transition);
+            letter-spacing: 0.3px;
         }
         
         .btn-process {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: var(--color-accent);
             color: white;
+            box-shadow: var(--shadow-md);
         }
         
-        .btn-process:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.4);
+        .btn-process:hover:not(:disabled) {
+            background: var(--color-accent-hover);
+            box-shadow: var(--shadow-lg);
+            transform: translateY(-1px);
+        }
+        
+        .btn-process:active:not(:disabled) {
+            transform: translateY(0);
         }
         
         .btn-process:disabled {
@@ -335,122 +640,207 @@ HTML_TEMPLATE = """
         }
         
         .btn-clear {
-            background: #e0e0e0;
-            color: #333;
+            background: var(--color-bg-light);
+            color: var(--color-primary);
+            border: 1px solid var(--color-border);
         }
         
         .btn-clear:hover {
-            background: #d0d0d0;
-        }
-        
-        .file-info {
-            margin-top: 20px;
-            padding: 15px;
-            background: #f0f9ff;
-            border-left: 4px solid #667eea;
-            border-radius: 4px;
-            display: none;
-        }
-        
-        .file-info.show {
-            display: block;
-        }
-        
-        .file-name {
-            color: #333;
-            font-weight: 600;
-            word-break: break-all;
+            background: var(--color-border);
+            border-color: var(--color-secondary);
         }
         
         .loading {
             display: none;
             text-align: center;
-            margin-top: 20px;
+            padding: 24px;
         }
         
         .loading.show {
             display: block;
+            animation: fadeIn 0.3s ease-out;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
         }
         
         .spinner {
-            border: 4px solid #f3f3f3;
-            border-top: 4px solid #667eea;
-            border-radius: 50%;
             width: 40px;
             height: 40px;
+            margin: 0 auto 12px;
+            border: 3px solid var(--color-border);
+            border-top-color: var(--color-accent);
+            border-radius: 50%;
             animation: spin 1s linear infinite;
-            margin: 0 auto 10px;
         }
         
         @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
+            to { transform: rotate(360deg); }
         }
         
-        .error {
-            color: #d32f2f;
-            padding: 15px;
-            background: #ffebee;
-            border-left: 4px solid #d32f2f;
-            border-radius: 4px;
-            margin-top: 20px;
+        .loading-text {
+            font-size: 14px;
+            color: var(--color-secondary);
+            font-weight: 500;
+        }
+        
+        .alert {
+            padding: 16px;
+            border-radius: 10px;
+            font-size: 14px;
             display: none;
+            align-items: center;
+            gap: 12px;
+            animation: slideDown 0.3s ease-out;
         }
         
-        .error.show {
-            display: block;
+        .alert.show {
+            display: flex;
+        }
+        
+        .alert-icon {
+            font-size: 20px;
+            flex-shrink: 0;
+        }
+        
+        .alert-content {
+            flex: 1;
+        }
+        
+        .alert-success {
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.2);
+            color: #065f46;
+        }
+        
+        .alert-success .alert-icon {
+            color: var(--color-success);
+        }
+        
+        .alert-error {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+            color: #7f1d1d;
+        }
+        
+        .alert-error .alert-icon {
+            color: var(--color-error);
         }
         
         .info-box {
-            background: #e3f2fd;
-            border-left: 4px solid #2196f3;
-            padding: 15px;
-            border-radius: 4px;
-            margin-bottom: 20px;
-            font-size: 14px;
-            color: #1565c0;
+            background: rgba(59, 130, 246, 0.05);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+            border-radius: 10px;
+            padding: 16px;
+            font-size: 13px;
+            color: #1e40af;
+            margin-bottom: 24px;
+            line-height: 1.6;
+        }
+        
+        .info-box strong {
+            font-weight: 600;
+            color: #1e3a8a;
+        }
+        
+        @media (max-width: 640px) {
+            .main-section {
+                padding: 24px;
+            }
+            
+            h1 {
+                font-size: 26px;
+            }
+            
+            .upload-area {
+                padding: 36px 20px;
+            }
+            
+            .button-group {
+                flex-direction: column;
+            }
+            
+            button {
+                width: 100%;
+            }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>📊 ETM API Excel Processor</h1>
-        <p class="subtitle">Загрузите Excel файл для обработки с интеграцией ETM</p>
-        
-        <div class="info-box">
-            Файл должен содержать колонки: <strong>"Наименование"</strong> и <strong>"Количество"</strong>
+    <div class="wrapper">
+        <div class="container">
+            <!-- Header -->
+            <div class="header-section">
+                <div class="logo">
+                    <span class="logo-icon">📊</span>
+                    <span>ETM Excel Pro</span>
+                </div>
+                <h1>Excel Processing</h1>
+                <p class="subtitle">Upload and process your Excel files with ETM API integration</p>
+            </div>
+
+            <!-- Main Form -->
+            <div class="main-section">
+                <form id="uploadForm" enctype="multipart/form-data">
+                    
+                    <!-- Info Box -->
+                    <div class="info-box">
+                        Your file must contain:<br>
+                        <strong>Required:</strong> "Наименование" (name) and "Количество" (quantity)<br>
+                        <strong>Result includes:</strong> Found name, article, unit, price, availability, status
+                    </div>
+
+                    <!-- Upload Area -->
+                    <div class="upload-wrapper">
+                        <label class="upload-label">Upload Excel File</label>
+                        <div class="upload-area" id="uploadArea" onclick="document.getElementById('fileInput').click()">
+                            <span class="upload-icon">📄</span>
+                            <div class="upload-text">Click to upload or drag & drop</div>
+                            <div class="upload-hint">XLSX format, up to 10 MB</div>
+                        </div>
+                        <input type="file" id="fileInput" name="file" accept=".xlsx" />
+                    </div>
+
+                    <!-- File Info -->
+                    <div class="file-info" id="fileInfo">
+                        <span class="file-info-icon">✓</span>
+                        <div class="file-info-content">
+                            <div class="file-name" id="fileName"></div>
+                        </div>
+                    </div>
+
+                    <!-- Action Buttons -->
+                    <div class="button-group">
+                        <button type="submit" class="btn-process" id="processBtn" disabled>
+                            Process File
+                        </button>
+                        <button type="button" class="btn-clear" id="clearBtn">
+                            Clear
+                        </button>
+                    </div>
+
+                    <!-- Loading State -->
+                    <div class="loading" id="loading">
+                        <div class="spinner"></div>
+                        <p class="loading-text">Processing your file...</p>
+                    </div>
+
+                    <!-- Alerts -->
+                    <div class="alert alert-success" id="successAlert">
+                        <span class="alert-icon">✓</span>
+                        <div class="alert-content" id="successMessage"></div>
+                    </div>
+                    <div class="alert alert-error" id="errorAlert">
+                        <span class="alert-icon">✕</span>
+                        <div class="alert-content" id="errorMessage"></div>
+                    </div>
+                </form>
+            </div>
         </div>
-        
-        <form id="uploadForm" enctype="multipart/form-data">
-            <div class="upload-area" id="uploadArea" onclick="document.getElementById('fileInput').click()">
-                <div class="upload-icon">📁</div>
-                <div class="upload-text">Нажмите для выбора файла</div>
-                <div class="upload-hint">или перетащите файл сюда (xlsx)</div>
-            </div>
-            <input type="file" id="fileInput" name="file" accept=".xlsx" />
-            
-            <div class="file-info" id="fileInfo">
-                <div class="file-name" id="fileName"></div>
-            </div>
-            
-            <div class="button-group">
-                <button type="submit" class="btn-process" id="processBtn" disabled>
-                    ▶ Обработать
-                </button>
-                <button type="button" class="btn-clear" id="clearBtn">
-                    ↺ Очистить
-                </button>
-            </div>
-            
-            <div class="loading" id="loading">
-                <div class="spinner"></div>
-                <p>Обработка файла...</p>
-            </div>
-            
-            <div class="error" id="error"></div>
-        </form>
     </div>
-    
+
     <script>
         const uploadArea = document.getElementById('uploadArea');
         const fileInput = document.getElementById('fileInput');
@@ -460,83 +850,87 @@ HTML_TEMPLATE = """
         const fileInfo = document.getElementById('fileInfo');
         const fileName = document.getElementById('fileName');
         const loading = document.getElementById('loading');
-        const errorDiv = document.getElementById('error');
-        
-        // Drag and drop
+        const successAlert = document.getElementById('successAlert');
+        const errorAlert = document.getElementById('errorAlert');
+        const successMessage = document.getElementById('successMessage');
+        const errorMessage = document.getElementById('errorMessage');
+
+        // Prevent default drag behaviors
         ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
             uploadArea.addEventListener(eventName, preventDefaults, false);
         });
-        
+
         function preventDefaults(e) {
             e.preventDefault();
             e.stopPropagation();
         }
-        
+
+        // Highlight drop area
         ['dragenter', 'dragover'].forEach(eventName => {
             uploadArea.addEventListener(eventName, () => {
                 uploadArea.classList.add('dragover');
             });
         });
-        
+
         ['dragleave', 'drop'].forEach(eventName => {
             uploadArea.addEventListener(eventName, () => {
                 uploadArea.classList.remove('dragover');
             });
         });
-        
+
         uploadArea.addEventListener('drop', handleDrop);
-        
+
         function handleDrop(e) {
             const dt = e.dataTransfer;
             const files = dt.files;
             fileInput.files = files;
             handleFileSelect();
         }
-        
+
         // File input change
         fileInput.addEventListener('change', handleFileSelect);
-        
+
         function handleFileSelect() {
             const file = fileInput.files[0];
+            hideAlerts();
             if (file) {
-                fileName.textContent = '✓ ' + file.name;
+                fileName.textContent = file.name;
                 fileInfo.classList.add('show');
                 processBtn.disabled = false;
-                errorDiv.classList.remove('show');
             } else {
                 fileInfo.classList.remove('show');
                 processBtn.disabled = true;
             }
         }
-        
+
         // Clear button
         clearBtn.addEventListener('click', () => {
             fileInput.value = '';
             fileInfo.classList.remove('show');
             processBtn.disabled = true;
-            errorDiv.classList.remove('show');
+            hideAlerts();
         });
-        
-        // Form submit
+
+        // Form submission
         uploadForm.addEventListener('submit', async (e) => {
             e.preventDefault();
-            
+
             const file = fileInput.files[0];
             if (!file) return;
-            
+
             loading.classList.add('show');
-            errorDiv.classList.remove('show');
+            hideAlerts();
             processBtn.disabled = true;
-            
+
             const formData = new FormData();
             formData.append('file', file);
-            
+
             try {
                 const response = await fetch('/upload', {
                     method: 'POST',
                     body: formData
                 });
-                
+
                 if (response.ok) {
                     const blob = await response.blob();
                     const url = window.URL.createObjectURL(blob);
@@ -547,28 +941,29 @@ HTML_TEMPLATE = """
                     a.click();
                     window.URL.revokeObjectURL(url);
                     document.body.removeChild(a);
-                    
-                    // Clear form after success
+
+                    loading.classList.remove('show');
                     fileInput.value = '';
                     fileInfo.classList.remove('show');
-                    
-                    errorDiv.classList.add('show');
-                    errorDiv.style.borderLeft = '4px solid #4caf50';
-                    errorDiv.style.background = '#e8f5e9';
-                    errorDiv.style.color = '#2e7d32';
-                    errorDiv.textContent = '✓ Файл успешно обработан и загружен!';
+
+                    successMessage.textContent = 'File processed successfully! Your result has been downloaded.';
+                    successAlert.classList.add('show');
                 } else {
                     const error = await response.json();
-                    throw new Error(error.detail || 'Ошибка обработки файла');
+                    throw new Error(error.detail || 'Failed to process file');
                 }
             } catch (error) {
-                errorDiv.classList.add('show');
-                errorDiv.textContent = '✗ Ошибка: ' + error.message;
-            } finally {
                 loading.classList.remove('show');
+                errorMessage.textContent = error.message;
+                errorAlert.classList.add('show');
                 processBtn.disabled = false;
             }
         });
+
+        function hideAlerts() {
+            successAlert.classList.remove('show');
+            errorAlert.classList.remove('show');
+        }
     </script>
 </body>
 </html>
@@ -593,8 +988,14 @@ async def upload_excel(file: UploadFile = File(...)):
     Ожидает файл с расширением .xlsx.
     Ожидаемые колонки: "Наименование", "Количество"
     
-    Returns:
-        List[Dict]: Список словарей с полями "name" и "quantity"
+    Возвращает Excel файл с колонками:
+    - Исходное название
+    - Найденное название  
+    - Артикул
+    - Единица измерения
+    - Цена за единицу
+    - Наличие / срок
+    - Статус
     """
     
     # Проверка типа файла
@@ -610,33 +1011,88 @@ async def upload_excel(file: UploadFile = File(...)):
         contents = await file.read()
         file_buffer = BytesIO(contents)
         
-        # Загрузка Excel файла через pandas
+        # СПОСОБ 1: Пробуем читать с заголовками
         df = pd.read_excel(file_buffer, engine='openpyxl')
         
-        # Проверка наличия необходимых колонок
-        required_columns = ["Наименование", "Количество"]
-        missing_columns = [col for col in required_columns if col not in df.columns]
+        # СПОСОБ 2: Если первая колонка - это число (индекс), значит файл БЕЗ заголовков
+        # или если колонки это просто "Unnamed" или значения из данных
+        has_proper_headers = False
         
-        if missing_columns:
-            logger.error(f"Отсутствуют колонки: {missing_columns}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Файл должен содержать колонки: {required_columns}. Отсутствуют: {missing_columns}"
-            )
+        # Проверяем есть ли разумные названия колонок
+        for col in df.columns:
+            col_str = str(col).lower()
+            # Если есть "Наименование", "Name", "Product" и т.д. - это заголовки
+            if any(x in col_str for x in ['наименование', 'название', 'qty', 'quantity', 'кол', 'name', 'product', 'item']):
+                has_proper_headers = True
+                break
+        
+        logger.info(f"Попытка 1: Колонки={list(df.columns)}, Заголовки OK={has_proper_headers}")
+        
+        # Если заголовки не выглядят правильно, пробуем без заголовков
+        if not has_proper_headers:
+            logger.info("Колонки не выглядят как заголовки - переоткрываю с header=None")
+            file_buffer = BytesIO(contents)
+            df = pd.read_excel(file_buffer, engine='openpyxl', header=None)
+            
+            # Даем стандартные имена первым двум колонкам (название и количество)
+            if len(df.columns) >= 2:
+                col_names = {0: 'Наименование', 1: 'Количество'}
+                for i in range(2, len(df.columns)):
+                    col_names[i] = f'Доп_колонка_{i}'
+                df = df.rename(columns=col_names)
+                logger.info(f"Переименованы колонки: {list(df.columns)}")
+        
+        logger.info(f"Итоговые колонки: {list(df.columns)}")
+        logger.info(f"Строк данных: {len(df)}")
+        
+        # Поиск колонок с совпадением (игнорируя регистр)
+        def find_column(df, patterns):
+            for col in df.columns:
+                col_lower = str(col).lower().strip()
+                for pattern in patterns:
+                    if col_lower == pattern.lower() or pattern.lower() in col_lower:
+                        return col
+            return None
+        
+        # Ищем колонки
+        name_col = find_column(df, ["наименование", "название", "product", "name", "товар", "item"])
+        qty_col = find_column(df, ["количество", "quantity", "кол", "qty", "кол-во"])
+        
+        logger.info(f"Найдены: name_col='{name_col}', qty_col='{qty_col}'")
+        
+        if not name_col or not qty_col:
+            cols = ", ".join(str(c) for c in df.columns[:5])
+            detail_msg = f"Не найдены необходимые колонки. Доступны: {cols}"
+            logger.error(detail_msg)
+            raise HTTPException(status_code=400, detail=f"❌ {detail_msg}")
+        
+        logger.info(f"Используем колонки: '{name_col}' для названия, '{qty_col}' для количества")
         
         # Преобразование данных в требуемый формат и обогащение данными из ETM
         result = []
         for index, row in df.iterrows():
-            name = str(row["Наименование"]).strip()
-            quantity = int(row["Количество"])
+            try:
+                original_name = str(row[name_col]).strip()
+                quantity = int(row[qty_col])
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Ошибка при обработке строки {index}: {e}")
+                continue
             
             # Поиск товара в ETM API
-            etm_result = search_etm(name)
+            etm_result = search_etm(original_name)
             
+            # Извлечение данных с выбором лучшего товара
+            etm_data = extract_etm_data(etm_result, original_name)
+            
+            # Формирование элемента результата
             item = {
-                "name": name,
-                "quantity": quantity,
-                "etm_result": etm_result
+                "Исходное название": original_name,
+                "Найденное название": etm_data['found_name'],
+                "Артикул": etm_data['article'],
+                "Единица измерения": etm_data['unit'],
+                "Цена за единицу": etm_data['unit_price'],
+                "Наличие / срок": etm_data['availability'],
+                "Статус": etm_data['status']
             }
             result.append(item)
         
@@ -670,10 +1126,27 @@ async def upload_excel(file: UploadFile = File(...)):
         )
     
     except Exception as e:
-        logger.error(f"Неожиданная ошибка: {str(e)}")
+        error_msg = str(e)
+        logger.error(f"Ошибка при обработке файла: {error_msg}")
+        
+        # Если это ошибка авторизации ETM API
+        if "авторизац" in error_msg.lower() or "login" in error_msg.lower() or "unauthorized" in error_msg.lower():
+            raise HTTPException(
+                status_code=401,
+                detail="❌ Ошибка авторизации ETM API. Проверьте учетные данные в переменных окружения ETM_LOGIN и ETM_PASSWORD"
+            )
+        
+        # Если это ошибка соединения
+        if "connection" in error_msg.lower() or "timeout" in error_msg.lower():
+            raise HTTPException(
+                status_code=503,
+                detail="❌ Ошибка соединения с ETM API. Проверьте интернет соединение и доступность API"
+            )
+        
+        # Общая ошибка
         raise HTTPException(
             status_code=500,
-            detail="Внутренняя ошибка сервера при обработке файла"
+            detail=f"❌ Ошибка обработки файла: {error_msg[:150]}"
         )
 
 
