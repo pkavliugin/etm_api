@@ -57,8 +57,8 @@ cache = TTLCache(maxsize=1000, ttl=3600)
 
 # Инициализация приложения
 app = FastAPI(
-    title="Excel Upload Service",
-    description="API для загрузки и обработки Excel файлов",
+    title="ETM Excel Processor",
+    description="Профессиональная обработка Excel спецификаций с интеграцией API ЭТМ",
     version="1.0.0"
 )
 
@@ -777,8 +777,8 @@ HTML_TEMPLATE = """
                     <span class="logo-icon">📊</span>
                     <span>ETM Excel Pro</span>
                 </div>
-                <h1>Excel Processing</h1>
-                <p class="subtitle">Upload and process your Excel files with ETM API integration</p>
+                <h1>Обработка Excel</h1>
+                <p class="subtitle">Загружайте и обрабатывайте Excel файлы с интеграцией ETM API</p>
             </div>
 
             <!-- Main Form -->
@@ -787,18 +787,18 @@ HTML_TEMPLATE = """
                     
                     <!-- Info Box -->
                     <div class="info-box">
-                        Your file must contain:<br>
-                        <strong>Required:</strong> "Наименование" (name) and "Количество" (quantity)<br>
-                        <strong>Result includes:</strong> Found name, article, unit, price, availability, status
+                        Ваш файл должен содержать:<br>
+                        <strong>Обязательно:</strong> "Наименование" (название) и "Количество"<br>
+                        <strong>Результат включает:</strong> Найденное название, артикул, единицу измерения, цену, наличие, статус
                     </div>
 
                     <!-- Upload Area -->
                     <div class="upload-wrapper">
-                        <label class="upload-label">Upload Excel File</label>
+                        <label class="upload-label">Загрузить Excel файл</label>
                         <div class="upload-area" id="uploadArea" onclick="document.getElementById('fileInput').click()">
                             <span class="upload-icon">📄</span>
-                            <div class="upload-text">Click to upload or drag & drop</div>
-                            <div class="upload-hint">XLSX format, up to 10 MB</div>
+                            <div class="upload-text">Нажмите для загрузки или перетащите файл</div>
+                            <div class="upload-hint">Формат XLSX, до 10 МБ</div>
                         </div>
                         <input type="file" id="fileInput" name="file" accept=".xlsx" />
                     </div>
@@ -814,17 +814,17 @@ HTML_TEMPLATE = """
                     <!-- Action Buttons -->
                     <div class="button-group">
                         <button type="submit" class="btn-process" id="processBtn" disabled>
-                            Process File
+                            Обработать файл
                         </button>
                         <button type="button" class="btn-clear" id="clearBtn">
-                            Clear
+                            Очистить
                         </button>
                     </div>
 
                     <!-- Loading State -->
                     <div class="loading" id="loading">
                         <div class="spinner"></div>
-                        <p class="loading-text">Processing your file...</p>
+                        <p class="loading-text">Обработка файла...</p>
                     </div>
 
                     <!-- Alerts -->
@@ -946,11 +946,11 @@ HTML_TEMPLATE = """
                     fileInput.value = '';
                     fileInfo.classList.remove('show');
 
-                    successMessage.textContent = 'File processed successfully! Your result has been downloaded.';
+                    successMessage.textContent = 'Файл успешно обработан! Результат скачан.';
                     successAlert.classList.add('show');
                 } else {
                     const error = await response.json();
-                    throw new Error(error.detail || 'Failed to process file');
+                    throw new Error(error.detail || 'Не удалось обработать файл');
                 }
             } catch (error) {
                 loading.classList.remove('show');
